@@ -1,7 +1,15 @@
+import json
+import shutil
+
 from fastapi import APIRouter, HTTPException, Request, Response, status
 
-from config import MAX_PAYLOAD_LENGTH
-from validation import InvalidBlobId, validate_blob_id
+from config import DATA_DIR, MAX_BLOBS_TOTAL, MAX_DISK_QUOTA, MAX_PAYLOAD_LENGTH
+from validation import (
+    InvalidBlobId,
+    InvalidHeaders,
+    validate_blob_id,
+    validate_stored_headers,
+)
 
 
 router = APIRouter()
@@ -9,12 +17,13 @@ router = APIRouter()
 
 # POST /blobs/{blob_id} — store or overwrite a blob
 @router.post("/{blob_id}")
-def store_blob(blob_id: str, request: Request):
+async def store_blob(blob_id: str, request: Request):
     try:
         validate_blob_id(blob_id)
     except InvalidBlobId as exc:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc))
 
+    # requiring the client to declare the payload size up front
     content_length_header = request.headers.get("content-length")
     if content_length_header is None:
         raise HTTPException(
@@ -30,22 +39,78 @@ def store_blob(blob_id: str, request: Request):
             detail="Content-Length header is not a valid integer",
         )
 
+    # rejectig payloads larger than the allowed maximum (by declared size)
     if content_length > MAX_PAYLOAD_LENGTH:
         raise HTTPException(
-            status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
+            status_code=status.HTTP_413_CONTENT_TOO_LARGE,
             detail="payload exceeds maximum allowed size",
         )
 
-    # TODO: validate payload length, disk quota, blob count
+    # keeping only the headers we are allowed to store (Content-Type and x-rebase-*)
+    stored_headers = {}
+    for name, value in request.headers.items():
+        lower_name = name.lower()
+        if lower_name == "content-type" or lower_name.startswith("x-rebase-"):
+            stored_headers[lower_name] = value
 
-    # TODO: extract storable headers:
-    # Content-Type and x-rebase-*
+    try:
+        validate_stored_headers(stored_headers)
+    except InvalidHeaders as exc:
+        raise HTTPException(
+            status_code=status.HTTP_431_REQUEST_HEADER_FIELDS_TOO_LARGE,
+            detail=str(exc),
+        )
 
-    # TODO: validate header constraints
+    body = await request.body()
 
-    # TODO: stream body to disk
+    # verifying the bytes we actually received match the declared size
+    if len(body) != content_length:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="request body size does not match Content-Length",
+        )
 
-    # TODO: persist metadata containing the stored headers
+    blobs_root = DATA_DIR / "blobs"
+    directory = blobs_root / blob_id
+    already_exists = directory.exists()
+
+    # Scanning current storage to enforce blob-count and disk-quota limits.
+    existing_count = 0
+    existing_total_bytes = 0
+    if blobs_root.exists():
+        for entry in blobs_root.iterdir():
+            if not entry.is_dir():
+                continue
+            existing_count += 1
+            data_file = entry / "data"
+            if data_file.exists():
+                existing_total_bytes += data_file.stat().st_size
+
+    # rejecting if this would push the total blob count over the limit
+    new_count = existing_count if already_exists else existing_count + 1
+    if new_count > MAX_BLOBS_TOTAL:
+        raise HTTPException(
+            status_code=status.HTTP_413_CONTENT_TOO_LARGE,
+            detail="maximum number of stored blobs exceeded",
+        )
+
+    # rejecting if the resulting total size would exceed the disk quota
+    # (subtracting the old bytes first when overwriting an existing blob)
+    replaced_bytes = 0
+    if already_exists and (directory / "data").exists():
+        replaced_bytes = (directory / "data").stat().st_size
+
+    new_total_bytes = existing_total_bytes - replaced_bytes + len(body)
+    if new_total_bytes > MAX_DISK_QUOTA:
+        raise HTTPException(
+            status_code=status.HTTP_413_CONTENT_TOO_LARGE,
+            detail="storage quota exceeded",
+        )
+
+    # Actually storing the payload and headers
+    directory.mkdir(parents=True, exist_ok=True)
+    (directory / "data").write_bytes(body)
+    (directory / "metadata.json").write_text(json.dumps(stored_headers))
 
     return Response(
         status_code=status.HTTP_201_CREATED,
@@ -62,19 +127,28 @@ def get_blob(blob_id: str):
     except InvalidBlobId as exc:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc))
 
-    # TODO: check whether the blob exists
-    # Return 404 if it does not
+    # returning 404 if the blob does not exist
+    directory = DATA_DIR / "blobs" / blob_id
+    data_file = directory / "data"
+    if not data_file.exists():
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="blob not found",
+        )
 
-    # TODO: read stored headers and add them to the response
+    # loading the headers that were stored alongside the blob (if any)
+    metadata_file = directory / "metadata.json"
+    stored_headers = {}
+    if metadata_file.exists():
+        stored_headers = json.loads(metadata_file.read_text())
 
-    # TODO: use application/octet-stream if Content-Type was not stored
-
-    # TODO: stream the file into the response
+    # pulling Content-Type out to set it once; use octet-stream as default
+    content_type = stored_headers.pop("content-type", "application/octet-stream")
 
     return Response(
-        status_code=status.HTTP_404_NOT_FOUND,
-        media_type="application/json",
-        content='{"error": "not found"}',
+        content=data_file.read_bytes(),
+        media_type=content_type,
+        headers=stored_headers,
     )
 
 
@@ -86,7 +160,9 @@ def delete_blob(blob_id: str):
     except InvalidBlobId as exc:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc))
 
-    # TODO: delete the blob and its metadata
-    # No 404 is required if they do not exist
+    # removing the blob directory; a missing blob is treated as already deleted
+    directory = DATA_DIR / "blobs" / blob_id
+    if directory.exists():
+        shutil.rmtree(directory)
 
     return Response(status_code=status.HTTP_204_NO_CONTENT)
