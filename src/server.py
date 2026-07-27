@@ -6,7 +6,7 @@ import uvicorn
 from fastapi import FastAPI
 
 from config import DATA_DIR, PORT
-from routes.blobs import router as blobs_router
+from routes.blobs import cleanup_temp_files, router as blobs_router
 
 
 def warmup() -> None:
@@ -15,11 +15,7 @@ def warmup() -> None:
     """
 
     Path(DATA_DIR).mkdir(parents=True, exist_ok=True)
-
-    # Future startup work belongs here:
-    # - count existing blobs
-    # - calculate current disk usage
-    # - remove abandoned temporary files
+    cleanup_temp_files()
 
 
 def create_app() -> FastAPI:
