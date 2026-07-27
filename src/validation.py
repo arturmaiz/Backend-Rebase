@@ -19,6 +19,10 @@ def validate_blob_id(blob_id: str) -> None:
     if not blob_id:
         raise InvalidBlobId("id must not be empty")
 
+    # "." / ".." resolve outside the blob storage directory.
+    if blob_id in {".", ".."}:
+        raise InvalidBlobId("id contains invalid characters")
+
     if len(blob_id) > MAX_ID_LENGTH:
         raise InvalidBlobId("id exceeds maximum length")
 
