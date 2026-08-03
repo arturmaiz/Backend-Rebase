@@ -25,19 +25,18 @@ from validation import (
 
 router = APIRouter()
 
+# Deferred design work and current assumptions are tracked in TODO.md.
+
 # Protects quota/count checks and mutations across concurrent requests to different ids.
 # Same-id concurrency is excluded by the assignment.
 _storage_lock = asyncio.Lock()
 
 BLOBS_ROOT = DATA_DIR / "blobs"
 STAGING_ROOT = BLOBS_ROOT / ".staging"
-
-
-def _atomic_write_text(path: Path, text: str) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    temp_path = path.with_name(f"{path.name}.tmp")
-    temp_path.write_text(text)
-    temp_path.replace(path)
+# Holds the previous version of a blob during an overwrite so a crash mid-swap
+# can be rolled back. Each backup is a wrapper dir: an "id" marker file plus a
+# "dir" subdir with the old blob contents. Dot-prefixed so scans skip it.
+BACKUP_ROOT = BLOBS_ROOT / ".backups"
 
 
 def _scan_storage() -> tuple[int, int]:
@@ -61,8 +60,39 @@ def _scan_storage() -> tuple[int, int]:
     return existing_count, existing_total_bytes
 
 
+def _recover_backups() -> None:
+    """Roll back overwrites that crashed mid-swap, then drop stale backups.
+
+    If a blob's committed dir is missing but we still hold its pre-overwrite
+    backup, the crash happened after the old dir was moved aside but before the
+    new one landed, so we restore the old version. Otherwise the swap either
+    completed or never removed the old dir, and the backup is safe to discard.
+    """
+    if not BACKUP_ROOT.exists():
+        return
+
+    for wrapper in BACKUP_ROOT.iterdir():
+        if not wrapper.is_dir():
+            wrapper.unlink(missing_ok=True)
+            continue
+
+        id_marker = wrapper / "id"
+        saved = wrapper / "dir"
+        if id_marker.exists() and saved.exists():
+            blob_id = id_marker.read_text()
+            target_dir = BLOBS_ROOT / blob_id
+            if not (target_dir / "data").exists():
+                if target_dir.exists():
+                    shutil.rmtree(target_dir, ignore_errors=True)
+                saved.replace(target_dir)
+
+        shutil.rmtree(wrapper, ignore_errors=True)
+
+
 def cleanup_temp_files() -> None:
-    """Remove leftover staging dirs and temp files from interrupted writes."""
+    """Recover interrupted overwrites and remove leftover staging dirs."""
+    _recover_backups()
+
     if STAGING_ROOT.exists():
         shutil.rmtree(STAGING_ROOT, ignore_errors=True)
 
@@ -74,9 +104,6 @@ def cleanup_temp_files() -> None:
             continue
 
         data_file = entry / "data"
-        for temp_file in entry.glob("*.tmp"):
-            temp_file.unlink(missing_ok=True)
-
         # Drop blob dirs that never finished committing a data file.
         if not data_file.exists() and not any(entry.iterdir()):
             entry.rmdir()
@@ -205,8 +232,13 @@ async def store_blob(blob_id: str, request: Request):
     staging_dir = STAGING_ROOT / f"{blob_id}.{uuid.uuid4().hex}"
     staging_data = staging_dir / "data"
 
+    committed = False
     try:
         await _stream_body_to_file(request, staging_data, content_length)
+
+        # Stage the payload and headers together so the commit is a single
+        # atomic directory rename (both files land, or neither does).
+        (staging_dir / "metadata.json").write_text(json.dumps(stored_headers))
 
         target_dir = BLOBS_ROOT / blob_id
         async with _storage_lock:
@@ -225,14 +257,27 @@ async def store_blob(blob_id: str, request: Request):
                 new_bytes=content_length,
             )
 
-            target_dir.mkdir(parents=True, exist_ok=True)
-            staging_data.replace(target_dir / "data")
-            _atomic_write_text(
-                target_dir / "metadata.json",
-                json.dumps(stored_headers),
-            )
+            BLOBS_ROOT.mkdir(parents=True, exist_ok=True)
+
+            # Overwrite is crash-safe: move the old blob aside first, put the
+            # new one in place, then drop the backup. If we crash between the
+            # two renames, startup recovery restores the old version.
+            backup_wrapper = None
+            if target_dir.exists():
+                BACKUP_ROOT.mkdir(parents=True, exist_ok=True)
+                backup_wrapper = BACKUP_ROOT / uuid.uuid4().hex
+                backup_wrapper.mkdir()
+                (backup_wrapper / "id").write_text(blob_id)
+                target_dir.replace(backup_wrapper / "dir")
+
+            staging_dir.replace(target_dir)
+            committed = True
+
+            if backup_wrapper is not None:
+                shutil.rmtree(backup_wrapper, ignore_errors=True)
     finally:
-        shutil.rmtree(staging_dir, ignore_errors=True)
+        if not committed:
+            shutil.rmtree(staging_dir, ignore_errors=True)
 
     return Response(
         status_code=status.HTTP_201_CREATED,
@@ -282,6 +327,12 @@ async def delete_blob(blob_id: str):
     async with _storage_lock:
         directory = BLOBS_ROOT / blob_id
         if directory.exists():
-            shutil.rmtree(directory)
+            # Atomically remove the blob from the live namespace by renaming it
+            # into staging first, then delete. A crash after the rename leaves
+            # the leftover in .staging, which startup recovery sweeps.
+            STAGING_ROOT.mkdir(parents=True, exist_ok=True)
+            trash = STAGING_ROOT / f"{blob_id}.delete.{uuid.uuid4().hex}"
+            directory.replace(trash)
+            shutil.rmtree(trash, ignore_errors=True)
 
     return Response(status_code=status.HTTP_204_NO_CONTENT)
