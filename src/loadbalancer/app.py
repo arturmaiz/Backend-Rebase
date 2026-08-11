@@ -7,9 +7,18 @@ import httpx
 import uvicorn
 from fastapi import FastAPI
 
-from . import lifecycle
-from .config import LB_HOST, LB_PORT, REGISTRATION_DURATION_SECONDS, UPSTREAM_TIMEOUT
-from .routes import blobs_router, internal_router
+from logging_setup import configure_logging
+
+logger = configure_logging("lb")
+
+from . import lifecycle  # noqa: E402
+from .config import (  # noqa: E402
+    LB_HOST,
+    LB_PORT,
+    REGISTRATION_DURATION_SECONDS,
+    UPSTREAM_TIMEOUT,
+)
+from .routes import blobs_router, internal_router  # noqa: E402
 
 
 @asynccontextmanager
@@ -25,9 +34,9 @@ async def lifespan(app: FastAPI):
         timeout=UPSTREAM_TIMEOUT, follow_redirects=False
     ) as client:
         app.state.client = client
-        print(
-            f"[startup] load balancer up; accepting node registrations for "
-            f"{REGISTRATION_DURATION_SECONDS}s"
+        logger.info(
+            "load balancer up; accepting node registrations for %ss",
+            REGISTRATION_DURATION_SECONDS,
         )
         yield
 
@@ -41,7 +50,9 @@ def create_app() -> FastAPI:
 
 def main() -> None:
     app = create_app()
-    uvicorn.run(app, host=LB_HOST, port=LB_PORT)
+    logger.info("starting load balancer on %s:%d", LB_HOST, LB_PORT)
+    # log_config=None keeps our logging_setup handlers (including Logz.io).
+    uvicorn.run(app, host=LB_HOST, port=LB_PORT, log_config=None)
 
 
 if __name__ == "__main__":

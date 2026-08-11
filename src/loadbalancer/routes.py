@@ -7,6 +7,8 @@ Two groups:
   node.
 """
 
+import logging
+
 import httpx
 from fastapi import APIRouter, Request
 from starlette.background import BackgroundTask
@@ -15,6 +17,8 @@ from starlette.responses import JSONResponse, StreamingResponse
 from . import lifecycle, registry, routing
 from .validation import InvalidRegistration, validate_registration
 
+
+logger = logging.getLogger("lb.routes")
 
 REGISTRATION_OVER_MESSAGE = (
     "the request was rejected because registration period is over"
@@ -69,7 +73,6 @@ async def register_node(request: Request):
         return JSONResponse(status_code=400, content={"errorMessage": str(exc)})
 
     node_id = registry.upsert(host, port, name)
-    print(f"[register] node {node_id} at {host}:{port} name={name!r}")
     return JSONResponse(status_code=200, content={"id": node_id})
 
 
@@ -104,6 +107,19 @@ async def _forward(request: Request, blob_id: str):
             content={"errorMessage": "no backend nodes are registered"},
         )
 
+    breaker = node["breaker"]
+    if breaker.is_burned():
+        logger.warning(
+            "node=%s is burned; returning 503 for %s /blobs/%s",
+            node["id"],
+            request.method,
+            blob_id,
+        )
+        return JSONResponse(
+            status_code=503,
+            content={"errorMessage": "backend node is temporarily unavailable"},
+        )
+
     url = f"http://{node['host']}:{node['port']}/blobs/{blob_id}"
 
     # Forward the client's headers, minus hop-by-hop and Host.
@@ -131,15 +147,39 @@ async def _forward(request: Request, blob_id: str):
     try:
         upstream = await client.send(upstream_request, stream=True)
     except httpx.TimeoutException:
+        # Assignment: only a timeout counts as a circuit-breaker failure.
+        breaker.record_failure()
+        logger.warning(
+            "timeout forwarding %s /blobs/%s to node=%s (%s:%d)",
+            request.method,
+            blob_id,
+            node["id"],
+            node["host"],
+            node["port"],
+        )
         return JSONResponse(
             status_code=504,
             content={"errorMessage": "backend node timed out"},
         )
-    except httpx.RequestError:
+    except httpx.RequestError as exc:
+        # Reachability errors are still 502 to the client, but do not trip the
+        # breaker (the assignment defines failure as a timeout only).
+        logger.warning(
+            "could not reach node=%s (%s:%d) for %s /blobs/%s: %s",
+            node["id"],
+            node["host"],
+            node["port"],
+            request.method,
+            blob_id,
+            exc,
+        )
         return JSONResponse(
             status_code=502,
             content={"errorMessage": "could not reach backend node"},
         )
+
+    # Any answer from the node (including 4xx/5xx) is a successful round-trip.
+    breaker.record_success()
 
     response_headers = {
         name: value
@@ -147,9 +187,13 @@ async def _forward(request: Request, blob_id: str):
         if name.lower() not in RESPONSE_DROP
     }
 
-    print(
-        f"[route] {request.method} /blobs/{blob_id} -> "
-        f"{node['host']}:{node['port']} ({upstream.status_code})"
+    logger.info(
+        "routed %s /blobs/%s -> %s:%d (%d)",
+        request.method,
+        blob_id,
+        node["host"],
+        node["port"],
+        upstream.status_code,
     )
 
     # Stream the node's response straight back, and close the upstream response

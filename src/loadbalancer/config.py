@@ -21,6 +21,9 @@ UPSTREAM_TIMEOUT = 30.0
 MAX_HOST_LENGTH = 50
 MAX_NAME_LENGTH = 50
 
-# --- Optional circuit-breaker feature (not used yet; reserved for later) ---
-NODE_MAX_FAILURES = 3
-BURNED_NODE_COOLDOWN_SECONDS = 60
+# Circuit breaker: consecutive timeouts that burn a node, and how long it stays
+# burned before the counter resets from scratch.
+NODE_MAX_FAILURES = int(os.getenv("NODE_MAX_FAILURES", "3"))
+BURNED_NODE_COOLDOWN_SECONDS = float(
+    os.getenv("BURNED_NODE_COOLDOWN_SECONDS", "60")
+)
