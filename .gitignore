@@ -1,6 +1,9 @@
 data/
+data-node*/
+data-test*/
 .env
 .DS_Store
 .venv/
 __pycache__/
 *.pyc
+logzio-failures-*.txt
