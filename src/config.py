@@ -6,7 +6,9 @@ from pathlib import Path
 PORT = int(os.getenv("PORT", "3000"))
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
-DATA_DIR = PROJECT_ROOT / "data"
+# Configurable so several node processes on one machine can each use their own
+# storage folder (e.g. DATA_DIR=data/node-8081). Defaults to <project>/data.
+DATA_DIR = Path(os.getenv("DATA_DIR", PROJECT_ROOT / "data"))
 
 MAX_PAYLOAD_LENGTH = 10 * 1024 * 1024  # 10 MiB
 MAX_DISK_QUOTA = 1024 * 1024 * 1024    # 1 GiB
