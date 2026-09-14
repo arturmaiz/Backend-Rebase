@@ -1,0 +1,10 @@
+.env
+.DS_Store
+.venv/
+__pycache__/
+*.pyc
+logzio-failures-*.txt
+
+# Local Postgres data directory and server log (never commit these).
+pgdata/
+pg.log
